@@ -15,21 +15,24 @@ app.use(helmet());
 
 // ── CORS ──────────────────────────────────────────────────────────────────
 const allowedOrigins = [
-  process.env.FRONTEND_URL || "http://localhost:5173",
+  process.env.FRONTEND_URL,
   "http://localhost:5173",
   "http://localhost:4173",
   "http://localhost:3000",
-];
+].filter(Boolean);
 
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow requests with no origin (Postman, curl, same-origin)
+      // No origin = same-origin, curl, Postman, or Vercel rewrite proxy
       if (!origin) return callback(null, true);
-      if (allowedOrigins.includes(origin) || process.env.NODE_ENV !== "production") {
-        return callback(null, true);
-      }
-      return callback(new Error(`CORS: origin ${origin} not allowed`));
+      // Allow any *.vercel.app subdomain (covers preview deploys too)
+      if (origin.endsWith(".vercel.app")) return callback(null, true);
+      // Allow explicitly listed origins
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      // In development allow everything
+      if (process.env.NODE_ENV !== "production") return callback(null, true);
+      return callback(new Error(`CORS blocked: ${origin}`));
     },
     credentials: true,
   })
@@ -37,7 +40,7 @@ app.use(
 
 // ── Rate limiting ─────────────────────────────────────────────────────────
 const limiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
+  windowMs: 60 * 1000,
   max: 60,
   standardHeaders: true,
   legacyHeaders: false,
@@ -71,7 +74,7 @@ app.get("/health", (req, res) => {
 app.use("/api/sessions", aiLimiter, sessionRoutes);
 app.use("/api/vocabulary", vocabularyRoutes);
 
-// ── 404 handler ───────────────────────────────────────────────────────────
+// ── 404 ───────────────────────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ error: "Route not found." });
 });
@@ -81,8 +84,8 @@ app.use(errorHandler);
 
 // ── Start ─────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n🎙️  Vocab Agent backend running on http://localhost:${PORT}`);
-  console.log(`   AI key: ${(process.env.GOOGLE_GENAI_API_KEY || process.env.OPENAI_API_KEY) ? "✓ configured" : "✗ MISSING — set GOOGLE_GENAI_API_KEY in .env"}`);
+  console.log(`\n  Vocab Agent backend running on http://localhost:${PORT}`);
+  console.log(`   AI key: ${(process.env.GOOGLE_GENAI_API_KEY || process.env.OPENAI_API_KEY) ? "configured" : "MISSING - set GOOGLE_GENAI_API_KEY in .env"}`);
   console.log(`   Environment: ${process.env.NODE_ENV || "development"}\n`);
 });
 
