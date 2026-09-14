@@ -5,7 +5,7 @@ services:
     region: oregon
     rootDir: backend
     buildCommand: npm install
-    startCommand: npm start
+    startCommand: node src/server.js
     envVars:
       - key: NODE_ENV
         value: production
@@ -13,3 +13,4 @@ services:
         sync: false
       - key: FRONTEND_URL
         sync: false
+    healthCheckPath: /health
