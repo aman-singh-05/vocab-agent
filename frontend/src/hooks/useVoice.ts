@@ -23,7 +23,7 @@ interface UseVoiceReturn {
 
 function cleanForSpeech(text: string): string {
   return text
-    .replace(/[*_`#]/g, '')
+    .replace(/[*_`#[\]]/g, '')
     .replace(/\n+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -38,10 +38,17 @@ function getSpeechRecognitionCtor(): (new () => SpeechRecognition) | null {
 export function useVoice({ onTranscript, onStateChange }: UseVoiceOptions): UseVoiceReturn {
   const [voiceState, setVoiceState] = useState<VoiceState>('idle');
   const [error, setError] = useState<string | null>(null);
+  const [isSupported] = useState<boolean>(() => {
+    // Evaluated once at mount — avoids flicker on re-renders
+    return (
+      !!getSpeechRecognitionCtor() &&
+      typeof window !== 'undefined' &&
+      !!window.speechSynthesis
+    );
+  });
 
-  // ── Stable refs ─────────────────────────────────────────────────────────
-  // Keep callbacks in refs so the recognition event handlers always call the
-  // latest version without needing to be re-registered on every render.
+  // Keep latest callbacks in refs — recognition handlers always see the
+  // current version without being re-registered
   const onTranscriptRef = useRef(onTranscript);
   const onStateChangeRef = useRef(onStateChange);
   useEffect(() => { onTranscriptRef.current = onTranscript; }, [onTranscript]);
@@ -49,23 +56,17 @@ export function useVoice({ onTranscript, onStateChange }: UseVoiceOptions): UseV
 
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const synthRef = useRef<SpeechSynthesis | null>(null);
-  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const listeningRef = useRef(false);
   const onEndCallbackRef = useRef<(() => void) | null>(null);
+  const keepAliveRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Derived support flag — computed once
-  const isSupported =
-    !!getSpeechRecognitionCtor() &&
-    typeof window !== 'undefined' &&
-    !!window.speechSynthesis;
-
-  // ── updateState helper ───────────────────────────────────────────────────
+  // Stable — only uses refs internally
   const updateState = useCallback((state: VoiceState) => {
     setVoiceState(state);
     onStateChangeRef.current?.(state);
-  }, []); // stable — uses ref for callback
+  }, []);
 
-  // ── Initialise recognition once on mount ────────────────────────────────
+  // ── Init speech recognition once ─────────────────────────────────────────
   useEffect(() => {
     const Ctor = getSpeechRecognitionCtor();
     if (!Ctor) return;
@@ -82,14 +83,12 @@ export function useVoice({ onTranscript, onStateChange }: UseVoiceOptions): UseV
     };
 
     rec.onresult = (event: SpeechRecognitionEvent) => {
-      // Move to processing immediately so the button disables
       updateState('processing');
       const transcript = event.results[0]?.[0]?.transcript?.trim();
       if (transcript) {
-        // Always calls the latest handler via ref
         onTranscriptRef.current(transcript);
       } else {
-        setError('No speech detected. Please try again.');
+        setError('No speech detected. Please speak clearly and try again.');
         updateState('idle');
       }
     };
@@ -99,19 +98,22 @@ export function useVoice({ onTranscript, onStateChange }: UseVoiceOptions): UseV
       switch (event.error) {
         case 'not-allowed':
         case 'service-not-allowed':
-          setError('Microphone access denied. Click the lock icon in your browser address bar and allow microphone access, then refresh.');
+          setError(
+            'Microphone blocked. Click the 🔒 icon in your browser address bar, ' +
+            'set Microphone to "Allow", then refresh the page.'
+          );
           break;
         case 'no-speech':
-          setError('No speech detected. Click the microphone and speak clearly.');
+          setError('Nothing heard. Click the mic and speak clearly.');
           break;
         case 'audio-capture':
-          setError('No microphone found. Please connect a microphone and try again.');
+          setError('No microphone detected. Please connect one and try again.');
           break;
         case 'network':
           setError('Speech recognition needs an internet connection.');
           break;
         case 'aborted':
-          break; // intentional stop, no message
+          break; // deliberate stop, no message
         default:
           setError(`Mic error: ${event.error}. Please try again.`);
       }
@@ -120,8 +122,7 @@ export function useVoice({ onTranscript, onStateChange }: UseVoiceOptions): UseV
 
     rec.onend = () => {
       listeningRef.current = false;
-      // Only drop back to idle if still in listening state —
-      // don't stomp on 'processing' that onresult just set.
+      // Don't overwrite 'processing' — onresult already set it
       setVoiceState((prev) => (prev === 'listening' ? 'idle' : prev));
     };
 
@@ -130,19 +131,21 @@ export function useVoice({ onTranscript, onStateChange }: UseVoiceOptions): UseV
 
     return () => {
       rec.abort();
+      if (keepAliveRef.current) clearInterval(keepAliveRef.current);
     };
-  }, [updateState]); // updateState is stable
+  }, [updateState]);
 
-  // ── startListening ───────────────────────────────────────────────────────
+  // ── startListening ────────────────────────────────────────────────────────
   const startListening = useCallback(() => {
     if (!recognitionRef.current) {
-      setError('Speech recognition is not supported. Please use Chrome or Edge.');
+      setError('Speech recognition is not supported. Please use Chrome or Edge on desktop.');
       return;
     }
 
-    // Cancel any TTS before listening so the mic doesn't pick up the speaker
+    // Mute any TTS so the mic doesn't echo the speaker
     if (synthRef.current?.speaking) {
       synthRef.current.cancel();
+      if (keepAliveRef.current) clearInterval(keepAliveRef.current);
       onEndCallbackRef.current = null;
     }
 
@@ -150,20 +153,21 @@ export function useVoice({ onTranscript, onStateChange }: UseVoiceOptions): UseV
 
     try {
       if (listeningRef.current) {
-        // Already running — stop and restart
         recognitionRef.current.stop();
-        setTimeout(() => recognitionRef.current?.start(), 250);
+        setTimeout(() => {
+          try { recognitionRef.current?.start(); } catch { /* ignore */ }
+        }, 300);
       } else {
         recognitionRef.current.start();
       }
     } catch (e) {
-      console.error('startListening error:', e);
-      setError('Failed to start microphone. Please try again.');
+      console.error('[startListening]', e);
+      setError('Could not start microphone. Please try again.');
       updateState('idle');
     }
   }, [updateState]);
 
-  // ── stopListening ────────────────────────────────────────────────────────
+  // ── stopListening ─────────────────────────────────────────────────────────
   const stopListening = useCallback(() => {
     if (recognitionRef.current && listeningRef.current) {
       recognitionRef.current.stop();
@@ -172,108 +176,85 @@ export function useVoice({ onTranscript, onStateChange }: UseVoiceOptions): UseV
     updateState('idle');
   }, [updateState]);
 
-  // ── speak ────────────────────────────────────────────────────────────────
-  const speak = useCallback(
-    (text: string, onEnd?: () => void) => {
-      const synth = synthRef.current;
-      if (!synth) {
-        onEnd?.();
-        return;
+  // ── speak ─────────────────────────────────────────────────────────────────
+  const speak = useCallback((text: string, onEnd?: () => void) => {
+    const synth = synthRef.current;
+    if (!synth) { onEnd?.(); return; }
+
+    // Kill any existing speech and keepalive
+    synth.cancel();
+    if (keepAliveRef.current) { clearInterval(keepAliveRef.current); keepAliveRef.current = null; }
+
+    const cleanText = cleanForSpeech(text);
+    if (!cleanText) { onEnd?.(); return; }
+
+    const utterance = new SpeechSynthesisUtterance(cleanText);
+    utterance.lang = 'en-US';
+    utterance.rate = 0.93;
+    utterance.pitch = 1.0;
+    utterance.volume = 1.0;
+
+    // Pick a natural-sounding English voice
+    const selectVoice = () => {
+      const voices = synth.getVoices();
+      const preferred = voices.find(
+        (v) =>
+          v.lang.startsWith('en') &&
+          (v.name.includes('Google') ||
+            v.name.includes('Samantha') ||
+            v.name.includes('Karen') ||
+            v.name.includes('Daniel') ||
+            v.name.includes('Moira') ||
+            v.name.includes('Serena') ||
+            v.name.includes('Arthur') ||
+            v.name.includes('Alex'))
+      );
+      if (preferred) utterance.voice = preferred;
+    };
+
+    if (synth.getVoices().length > 0) {
+      selectVoice();
+    } else {
+      synth.addEventListener('voiceschanged', selectVoice, { once: true });
+    }
+
+    const handleDone = () => {
+      if (keepAliveRef.current) { clearInterval(keepAliveRef.current); keepAliveRef.current = null; }
+      updateState('idle');
+      const cb = onEndCallbackRef.current;
+      onEndCallbackRef.current = null;
+      cb?.();
+    };
+
+    onEndCallbackRef.current = onEnd ?? null;
+    utterance.onstart = () => updateState('speaking');
+    utterance.onend = handleDone;
+    utterance.onerror = (e) => {
+      if (e.error !== 'interrupted' && e.error !== 'canceled') {
+        console.warn('[TTS]', e.error);
       }
+      handleDone();
+    };
 
-      synth.cancel(); // stop anything already playing
+    updateState('speaking');
+    synth.speak(utterance);
 
-      const cleanText = cleanForSpeech(text);
-      if (!cleanText) {
-        onEnd?.();
-        return;
+    // Chrome bug: speechSynthesis silently stops after ~15 s.
+    // Keepalive: pause/resume every 10 s to prevent it.
+    keepAliveRef.current = setInterval(() => {
+      if (!synth.speaking) {
+        clearInterval(keepAliveRef.current!);
+        keepAliveRef.current = null;
+      } else if (!synth.paused) {
+        synth.pause();
+        synth.resume();
       }
+    }, 10000);
+  }, [updateState]);
 
-      const utterance = new SpeechSynthesisUtterance(cleanText);
-      utterance.lang = 'en-US';
-      utterance.rate = 0.93;
-      utterance.pitch = 1.0;
-      utterance.volume = 1.0;
-
-      // Pick a natural English voice when voices are available
-      const selectVoice = () => {
-        const voices = synth.getVoices();
-        const pick = voices.find(
-          (v) =>
-            v.lang.startsWith('en') &&
-            (v.name.includes('Google') ||
-              v.name.includes('Samantha') ||
-              v.name.includes('Karen') ||
-              v.name.includes('Daniel') ||
-              v.name.includes('Moira') ||
-              v.name.includes('Serena') ||
-              v.name.includes('Arthur'))
-        );
-        if (pick) utterance.voice = pick;
-      };
-
-      if (synth.getVoices().length > 0) {
-        selectVoice();
-      } else {
-        synth.addEventListener('voiceschanged', selectVoice, { once: true });
-      }
-
-      onEndCallbackRef.current = onEnd ?? null;
-
-      utterance.onstart = () => updateState('speaking');
-
-      utterance.onend = () => {
-        updateState('idle');
-        onEndCallbackRef.current?.();
-        onEndCallbackRef.current = null;
-      };
-
-      utterance.onerror = (e) => {
-        if (e.error !== 'interrupted' && e.error !== 'canceled') {
-          console.warn('TTS error:', e.error);
-        }
-        updateState('idle');
-        onEndCallbackRef.current?.();
-        onEndCallbackRef.current = null;
-      };
-
-      utteranceRef.current = utterance;
-      updateState('speaking');
-
-      // Chrome has a bug where speech can silently stop after ~15 s.
-      // Resume it every 10 s as a keepalive.
-      const keepAlive = setInterval(() => {
-        if (synth.speaking && !synth.paused) {
-          synth.pause();
-          synth.resume();
-        } else {
-          clearInterval(keepAlive);
-        }
-      }, 10000);
-
-      utterance.onend = () => {
-        clearInterval(keepAlive);
-        updateState('idle');
-        onEndCallbackRef.current?.();
-        onEndCallbackRef.current = null;
-      };
-      utterance.onerror = (e) => {
-        clearInterval(keepAlive);
-        if (e.error !== 'interrupted' && e.error !== 'canceled') {
-          console.warn('TTS error:', e.error);
-        }
-        updateState('idle');
-        onEndCallbackRef.current?.();
-        onEndCallbackRef.current = null;
-      };
-
-      synth.speak(utterance);
-    },
-    [updateState]
-  );
-
-  // ── cancelSpeech ─────────────────────────────────────────────────────────
+  // ── cancelSpeech ──────────────────────────────────────────────────────────
   const cancelSpeech = useCallback(() => {
+    if (keepAliveRef.current) { clearInterval(keepAliveRef.current); keepAliveRef.current = null; }
     synthRef.current?.cancel();
     onEndCallbackRef.current = null;
     updateState('idle');

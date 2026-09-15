@@ -19,60 +19,63 @@ export function Session({ onEnd }: SessionPageProps) {
   const [localVoiceState, setLocalVoiceState] = useState<VoiceState>('idle');
   const hasIntroduced = useRef(false);
 
-  // Stable ref so handleTranscript can call speak without a circular dependency
+  // Stable ref — lets handleTranscript call speak() before voice is declared
   const speakRef = useRef<(text: string, onEnd?: () => void) => void>(() => {});
 
-  // ── handleTranscript uses speakRef.current to avoid ordering issues ──────
-  const handleTranscript = useCallback(
-    async (text: string) => {
-      if (!sessionId || !currentWord) return;
+  // Also keep sessionId + currentWord in refs so callbacks never go stale
+  const sessionIdRef = useRef(sessionId);
+  const currentWordRef = useRef(currentWord);
+  useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
+  useEffect(() => { currentWordRef.current = currentWord; }, [currentWord]);
 
-      addTranscript('user', text);
-      dispatch({ type: 'SET_LOADING', payload: true });
-      setLocalVoiceState('processing');
-      dispatch({ type: 'SET_VOICE_STATE', payload: 'processing' });
+  // ── handleTranscript ──────────────────────────────────────────────────────
+  const handleTranscript = useCallback(async (text: string) => {
+    const sid = sessionIdRef.current;
+    const word = currentWordRef.current;
+    if (!sid || !word) return;
 
-      try {
-        const data = await api.respond(sessionId, text);
+    addTranscript('user', text);
+    dispatch({ type: 'SET_LOADING', payload: true });
+    setLocalVoiceState('processing');
+    dispatch({ type: 'SET_VOICE_STATE', payload: 'processing' });
 
-        addTranscript('assistant', data.reply);
-        dispatch({ type: 'SET_READY_FOR_NEXT', payload: data.readyForNext });
-        dispatch({ type: 'SET_LAST_WORD_CORRECT', payload: data.wordUsedCorrectly });
-        dispatch({ type: 'SET_LOADING', payload: false });
+    try {
+      const data = await api.respond(sid, text);
 
-        // Speak reply through the stable ref
-        speakRef.current(data.reply, () => {
-          setLocalVoiceState('idle');
-          dispatch({ type: 'SET_VOICE_STATE', payload: 'idle' });
-        });
-      } catch (err) {
-        dispatch({ type: 'SET_LOADING', payload: false });
-        const msg =
-          err instanceof ApiError ? err.message : 'Failed to get a response. Please try again.';
-        dispatch({ type: 'SET_ERROR', payload: msg });
+      addTranscript('assistant', data.reply);
+      dispatch({ type: 'SET_READY_FOR_NEXT', payload: data.readyForNext });
+      dispatch({ type: 'SET_LAST_WORD_CORRECT', payload: data.wordUsedCorrectly });
+      dispatch({ type: 'SET_LOADING', payload: false });
+
+      speakRef.current(data.reply, () => {
         setLocalVoiceState('idle');
         dispatch({ type: 'SET_VOICE_STATE', payload: 'idle' });
-      }
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [sessionId, currentWord?.id]
-  );
+      });
+    } catch (err) {
+      dispatch({ type: 'SET_LOADING', payload: false });
+      const msg = err instanceof ApiError ? err.message : 'Failed to get a response. Please try again.';
+      dispatch({ type: 'SET_ERROR', payload: msg });
+      setLocalVoiceState('idle');
+      dispatch({ type: 'SET_VOICE_STATE', payload: 'idle' });
+    }
+  // No deps needed — everything is accessed via stable refs
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // ── Voice hook ────────────────────────────────────────────────────────────
   const voice = useVoice({
     onTranscript: handleTranscript,
-    onStateChange: (s) => {
+    onStateChange: useCallback((s: VoiceState) => {
       setLocalVoiceState(s);
       dispatch({ type: 'SET_VOICE_STATE', payload: s });
-    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []),
   });
 
-  // Keep speakRef in sync with the latest speak function
-  useEffect(() => {
-    speakRef.current = voice.speak;
-  }, [voice.speak]);
+  // Keep speakRef current
+  useEffect(() => { speakRef.current = voice.speak; }, [voice.speak]);
 
-  // ── Speak introduction when a new word's first assistant message arrives ──
+  // ── Speak word introduction when transcript first arrives ─────────────────
   useEffect(() => {
     if (!currentWord || hasIntroduced.current) return;
     const lastEntry = transcript[transcript.length - 1];
@@ -85,31 +88,44 @@ export function Session({ onEnd }: SessionPageProps) {
         dispatch({ type: 'SET_VOICE_STATE', payload: 'idle' });
       });
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [transcript]);
 
-  // Reset intro flag when word changes
-  useEffect(() => {
-    hasIntroduced.current = false;
-  }, [currentWord?.id]);
+  // Reset intro flag on word change
+  useEffect(() => { hasIntroduced.current = false; }, [currentWord?.id]);
 
-  // ── Mic button ────────────────────────────────────────────────────────────
-  const handleMicClick = () => {
-    if (localVoiceState === 'listening') {
-      voice.stopListening();
-    } else if (localVoiceState === 'idle') {
-      voice.clearError();
-      dispatch({ type: 'SET_ERROR', payload: null });
-      voice.startListening();
+  // ── End session (defined before handleNextWord so it's always fresh) ──────
+  const handleEndSession = useCallback(async () => {
+    const sid = sessionIdRef.current;
+    if (!sid) return;
+
+    voice.cancelSpeech();
+    dispatch({ type: 'SET_LOADING', payload: true });
+    dispatch({ type: 'SET_ERROR', payload: null });
+
+    try {
+      const summary = await api.endSession(sid);
+      dispatch({ type: 'SET_SUMMARY', payload: summary });
+      onEnd();
+    } catch (err) {
+      dispatch({ type: 'SET_LOADING', payload: false });
+      const msg = err instanceof ApiError ? err.message : 'Failed to end session.';
+      dispatch({ type: 'SET_ERROR', payload: msg });
     }
-  };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onEnd]);
+
+  // Keep a ref to handleEndSession so handleNextWord can call it without stale closure
+  const handleEndSessionRef = useRef(handleEndSession);
+  useEffect(() => { handleEndSessionRef.current = handleEndSession; }, [handleEndSession]);
 
   // ── Next word ─────────────────────────────────────────────────────────────
   const handleNextWord = useCallback(async () => {
-    if (!sessionId) return;
+    const sid = sessionIdRef.current;
+    if (!sid) return;
 
     if (progress.current >= progress.total) {
-      handleEndSession();
+      handleEndSessionRef.current();
       return;
     }
 
@@ -118,11 +134,8 @@ export function Session({ onEnd }: SessionPageProps) {
     dispatch({ type: 'SET_ERROR', payload: null });
 
     try {
-      const data = await api.nextWord(sessionId);
-      dispatch({
-        type: 'WORD_UPDATED',
-        payload: { currentWord: data.currentWord, progress: data.progress },
-      });
+      const data = await api.nextWord(sid);
+      dispatch({ type: 'WORD_UPDATED', payload: { currentWord: data.currentWord, progress: data.progress } });
       addTranscript('assistant', data.introduction);
       dispatch({ type: 'SET_LOADING', payload: false });
 
@@ -137,30 +150,21 @@ export function Session({ onEnd }: SessionPageProps) {
       const msg = err instanceof ApiError ? err.message : 'Failed to load next word.';
       dispatch({ type: 'SET_ERROR', payload: msg });
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, progress.current, progress.total]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [progress.current, progress.total]);
 
-  // ── End session ───────────────────────────────────────────────────────────
-  const handleEndSession = useCallback(async () => {
-    if (!sessionId) return;
-
-    voice.cancelSpeech();
-    dispatch({ type: 'SET_LOADING', payload: true });
-    dispatch({ type: 'SET_ERROR', payload: null });
-
-    try {
-      const summary = await api.endSession(sessionId);
-      dispatch({ type: 'SET_SUMMARY', payload: summary });
-      onEnd();
-    } catch (err) {
-      dispatch({ type: 'SET_LOADING', payload: false });
-      const msg = err instanceof ApiError ? err.message : 'Failed to end session.';
-      dispatch({ type: 'SET_ERROR', payload: msg });
+  // ── Mic button ────────────────────────────────────────────────────────────
+  const handleMicClick = () => {
+    if (localVoiceState === 'listening') {
+      voice.stopListening();
+    } else if (localVoiceState === 'idle') {
+      voice.clearError();
+      dispatch({ type: 'SET_ERROR', payload: null });
+      voice.startListening();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, onEnd]);
+  };
 
-  // ── Derived state ─────────────────────────────────────────────────────────
+  // ── Derived ───────────────────────────────────────────────────────────────
   const isInteractionDisabled =
     localVoiceState === 'processing' || localVoiceState === 'speaking' || isLoading;
   const isLastWord = progress.current >= progress.total;
@@ -175,7 +179,7 @@ export function Session({ onEnd }: SessionPageProps) {
 
   return (
     <div className="min-h-screen bg-cream-50 flex flex-col">
-      {/* Top bar */}
+      {/* Header */}
       <header className="px-6 py-4 flex items-center justify-between max-w-2xl mx-auto w-full border-b border-gray-100">
         <span className="text-lg font-display font-bold text-gray-900">Lingo</span>
         <div className="flex items-center gap-3">
@@ -190,9 +194,8 @@ export function Session({ onEnd }: SessionPageProps) {
         </div>
       </header>
 
-      {/* Main content */}
       <main className="flex-1 flex flex-col items-center px-6 py-8 gap-8 max-w-2xl mx-auto w-full">
-        {/* Vocabulary word card */}
+        {/* Word */}
         <WordCard word={currentWord} progress={progress} />
 
         {/* Errors */}
@@ -206,7 +209,7 @@ export function Session({ onEnd }: SessionPageProps) {
           />
         )}
 
-        {/* Voice interaction */}
+        {/* Mic interaction */}
         <div className="flex flex-col items-center gap-4">
           <MicButton
             voiceState={localVoiceState}
@@ -214,7 +217,6 @@ export function Session({ onEnd }: SessionPageProps) {
             disabled={isInteractionDisabled}
           />
 
-          {/* Advance buttons */}
           {(readyForNext || isLastWord) && !isInteractionDisabled && (
             <button
               onClick={handleNextWord}
@@ -224,7 +226,6 @@ export function Session({ onEnd }: SessionPageProps) {
             </button>
           )}
 
-          {/* Manual skip after enough exchanges */}
           {!readyForNext && !isLastWord && transcript.length >= 4 && !isInteractionDisabled && (
             <button
               onClick={handleNextWord}
@@ -235,17 +236,17 @@ export function Session({ onEnd }: SessionPageProps) {
           )}
         </div>
 
-        {/* Conversation transcript */}
+        {/* Transcript */}
         <Transcript
           entries={transcript}
           isLoading={isLoading && localVoiceState === 'processing'}
         />
       </main>
 
-      {/* Browser support warning */}
+      {/* Browser warning */}
       {!voice.isSupported && (
         <div className="fixed bottom-4 left-1/2 -translate-x-1/2 bg-amber-50 border border-amber-200 text-amber-800 text-sm rounded-xl px-4 py-3 shadow-md max-w-sm text-center">
-          Your browser doesn't fully support voice features. Try Chrome or Edge for the best experience.
+          Voice features require Chrome or Edge on desktop. Safari and Firefox are not supported.
         </div>
       )}
     </div>
@@ -254,15 +255,13 @@ export function Session({ onEnd }: SessionPageProps) {
 
 function StatusDot({ voiceState }: { voiceState: VoiceState }) {
   const config: Record<VoiceState, { color: string; label: string }> = {
-    idle: { color: 'bg-gray-300', label: 'Ready' },
-    listening: { color: 'bg-red-500 animate-pulse', label: 'Listening' },
-    processing: { color: 'bg-amber-400 animate-pulse', label: 'Thinking' },
-    speaking: { color: 'bg-emerald-500 animate-pulse', label: 'Speaking' },
-    error: { color: 'bg-red-600', label: 'Error' },
+    idle:       { color: 'bg-gray-300',                  label: 'Ready'      },
+    listening:  { color: 'bg-red-500 animate-pulse',     label: 'Listening'  },
+    processing: { color: 'bg-amber-400 animate-pulse',   label: 'Thinking'   },
+    speaking:   { color: 'bg-emerald-500 animate-pulse', label: 'Speaking'   },
+    error:      { color: 'bg-red-600',                   label: 'Error'      },
   };
-
   const { color, label } = config[voiceState] ?? config.idle;
-
   return (
     <div className="flex items-center gap-1.5">
       <span className={`w-2 h-2 rounded-full ${color}`} />
